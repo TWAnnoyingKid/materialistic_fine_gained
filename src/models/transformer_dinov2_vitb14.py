@@ -237,10 +237,10 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         self.cross_attention_3 = CrossAttentionWithReferenceEmbedding(attn_out_feats, out_channels, stride=8)
         self.cross_attention_4 = CrossAttentionWithReferenceEmbedding(attn_out_feats, out_channels, stride=8)
 
-        # Feature fusion head (DPT-style) — unified target size => disable upsampling to keep shapes equal
-        self.fusion_1 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=False)
-        self.fusion_2 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=False)
-        self.fusion_3 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=False)
+        # Feature fusion head (DPT-style): upsample x2 for path1-3; path4 no upsample
+        self.fusion_1 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=True, upsample_scale=2.0)
+        self.fusion_2 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=True, upsample_scale=2.0)
+        self.fusion_3 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=True, upsample_scale=2.0)
         self.fusion_4 = FeatureFusionBlock_custom(out_channels, nn.ReLU(), align_corners=True, upsample=False)
 
         # Per-pixel MLP head
@@ -355,27 +355,33 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         target_3 = (agg_3.shape[2], agg_3.shape[3])
         target_4 = (agg_4.shape[2], agg_4.shape[3])
 
-        emb_1 = agg_1.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_2 = agg_2.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_3 = agg_3.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_4 = agg_4.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        # Spatial processing (Materialistic-style fixed upsample factors)
+        sp1 = F.interpolate(agg_1, scale_factor=4.0, mode='bilinear', align_corners=True)
+        sp2 = F.interpolate(agg_2, scale_factor=2.0, mode='bilinear', align_corners=True)
+        sp3 = agg_3
+        sp4 = agg_4
+
+        emb_1 = sp1.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_2 = sp2.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_3 = sp3.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_4 = sp4.permute(0, 2, 3, 1).reshape(B, -1, 256)
 
         # compute dynamic strides from output/image size and feature map size
         H, W = out_size
-        stride_1 = max(1, round(H / target_1[0]))
-        stride_2 = max(1, round(H / target_2[0]))
-        stride_3 = max(1, round(H / target_3[0]))
-        stride_4 = max(1, round(H / target_4[0]))
+        stride_1 = max(1, H // sp1.shape[2])
+        stride_2 = max(1, H // sp2.shape[2])
+        stride_3 = max(1, H // sp3.shape[2])
+        stride_4 = max(1, H // sp4.shape[2])
 
         ca1, *_ = self.cross_attention_1(emb_1, reference_locations, stride_override=stride_1)
         ca2, *_ = self.cross_attention_2(emb_2, reference_locations, stride_override=stride_2)
         ca3, *_ = self.cross_attention_3(emb_3, reference_locations, stride_override=stride_3)
         ca4, *_ = self.cross_attention_4(emb_4, reference_locations, stride_override=stride_4)
 
-        ca1 = ca1.permute(0, 2, 1).reshape(B, -1, target_1[0], target_1[1])
-        ca2 = ca2.permute(0, 2, 1).reshape(B, -1, target_2[0], target_2[1])
-        ca3 = ca3.permute(0, 2, 1).reshape(B, -1, target_3[0], target_3[1])
-        ca4 = ca4.permute(0, 2, 1).reshape(B, -1, target_4[0], target_4[1])
+        ca1 = ca1.permute(0, 2, 1).reshape(B, -1, sp1.shape[2], sp1.shape[3])
+        ca2 = ca2.permute(0, 2, 1).reshape(B, -1, sp2.shape[2], sp2.shape[3])
+        ca3 = ca3.permute(0, 2, 1).reshape(B, -1, sp3.shape[2], sp3.shape[3])
+        ca4 = ca4.permute(0, 2, 1).reshape(B, -1, sp4.shape[2], sp4.shape[3])
 
         path4 = self.fusion_4(ca4)
         path3 = self.fusion_3(ca3, path4)
