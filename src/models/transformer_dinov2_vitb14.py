@@ -49,35 +49,28 @@ class Unflatten(nn.Module):
         return x
 
 
-def init_weights(self, init_type='xavier_uniform', gain=0.02):
-    def init_func(m):
-        classname = m.__class__.__name__
-        if classname.find('BatchNorm2d') != -1:
-            if hasattr(m, 'weight') and m.weight is not None:
-                init.normal_(m.weight.data, 1.0, gain)
-            if hasattr(m, 'bias') and m.bias is not None:
-                init.constant_(m.bias.data, 0.0)
-        elif hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
-            if init_type == 'normal':
-                init.normal_(m.weight.data, 0.0, gain)
-            elif init_type == 'xavier':
-                init.xavier_normal_(m.weight.data, gain=gain)
-            elif init_type == 'xavier_uniform':
-                init.xavier_uniform_(m.weight.data, gain=1.0)
-            elif init_type == 'kaiming':
-                init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
-            elif init_type == 'orthogonal':
-                init.orthogonal_(m.weight.data, gain=gain)
-            elif init_type == 'none':
-                m.reset_parameters()
-            else:
-                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
-            if hasattr(m, 'bias') and m.bias is not None:
-                init.constant_(m.bias.data, 0.0)
-
-    self.apply(init_func)
-    for n, m in self.named_children():
-        m.apply(init_weights)
+def weights_init(m, init_type='xavier_uniform', gain=0.02):
+    classname = m.__class__.__name__
+    if 'BatchNorm2d' in classname:
+        if getattr(m, 'weight', None) is not None:
+            init.normal_(m.weight.data, 1.0, gain)
+        if getattr(m, 'bias', None) is not None:
+            init.constant_(m.bias.data, 0.0)
+    elif hasattr(m, 'weight') and ('Conv' in classname or 'Linear' in classname):
+        if init_type == 'normal':
+            init.normal_(m.weight.data, 0.0, gain)
+        elif init_type == 'xavier':
+            init.xavier_normal_(m.weight.data, gain=gain)
+        elif init_type == 'xavier_uniform':
+            init.xavier_uniform_(m.weight.data, gain=1.0)
+        elif init_type == 'kaiming':
+            init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+        elif init_type == 'orthogonal':
+            init.orthogonal_(m.weight.data, gain=gain)
+        elif init_type == 'none':
+            m.reset_parameters()
+        if getattr(m, 'bias', None) is not None:
+            init.constant_(m.bias.data, 0.0)
 
 
 def local_pixel_coord(x, y, s):
@@ -91,6 +84,17 @@ def local_pixel_coord(x, y, s):
     out_y = (y - patch_center_y) / ((s - 1) / 2 + 1e-4)
     return out_x, out_y
 
+def local_pixel_coord_float(x, y, s_float):
+    patch_idx_x = torch.floor(x / s_float)
+    patch_idx_y = torch.floor(y / s_float)
+
+    patch_center_x = patch_idx_x * s_float + (s_float - 1.)/2.
+    patch_center_y = patch_idx_y * s_float + (s_float - 1.)/2.
+
+    out_x = (x - patch_center_x) / ((s_float - 1.) / 2 + 1e-4)
+    out_y = (y - patch_center_y) / ((s_float - 1.) / 2 + 1e-4)
+    return out_x, out_y
+
 
 class ReferenceEmbedding(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -102,12 +106,29 @@ class ReferenceEmbedding(nn.Module):
         )
         self.stride = stride
 
-    def forward(self, embeddings, reference_locations):
-        reference_locations_patch = torch.div(reference_locations, self.stride, rounding_mode="trunc")
-        reference_embeddings = embeddings[range(embeddings.shape[0]), :, reference_locations_patch[:, 0].type(torch.long), reference_locations_patch[:, 1].type(torch.long)]
+    def forward(self, embeddings, reference_locations, image_size=None):
+        B, C, Hf, Wf = embeddings.shape
+        if image_size is not None:
+            H_pad, W_pad = image_size
+            ref_h = torch.round(reference_locations[:, 0].float() * (Hf / float(H_pad)))
+            ref_w = torch.round(reference_locations[:, 1].float() * (Wf / float(W_pad)))
+            ref_h = ref_h.clamp(0, Hf - 1).long()
+            ref_w = ref_w.clamp(0, Wf - 1).long()
 
-        local_coordinate = local_pixel_coord(reference_locations[:, 0].type(torch.long), reference_locations[:, 1].type(torch.long), self.stride)
-        local_coordinate = torch.stack(local_coordinate, dim=1).to(embeddings.device)
+            s_h = float(H_pad) / float(Hf)
+            s_w = float(W_pad) / float(Wf)
+            s_float = (s_h + s_w) / 2.0
+
+            reference_embeddings = embeddings[range(B), :, ref_h, ref_w]
+            lx, ly = local_pixel_coord_float(reference_locations[:, 1].float(), reference_locations[:, 0].float(), s_float)
+            local_coordinate = torch.stack([lx, ly], dim=1).to(embeddings.device)
+        else:
+            ref = torch.div(reference_locations, self.stride, rounding_mode="trunc")
+            ref_h = ref[:, 0].clamp(0, Hf - 1).long()
+            ref_w = ref[:, 1].clamp(0, Wf - 1).long()
+            reference_embeddings = embeddings[range(B), :, ref_h, ref_w]
+            lx, ly = local_pixel_coord(reference_locations[:, 1].float(), reference_locations[:, 0].float(), self.stride)
+            local_coordinate = torch.stack([lx, ly], dim=1).to(embeddings.device)
 
         reference_embeddings = torch.cat([reference_embeddings, local_coordinate], dim=1)
         reference_embeddings = self.reference_feature_extractor(reference_embeddings)
@@ -135,14 +156,16 @@ class CrossAttentionWithReferenceEmbedding(nn.Module):
         self.out = nn.Linear(out_channels, out_channels)
         self.out_norm = nn.LayerNorm(out_channels)
 
-    def forward(self, embeddings, reference_locations, reference_embeddings=None, stride_override=None):
+    def forward(self, embeddings, reference_locations, reference_embeddings=None, stride_override=None, image_size=None):
         B, N, C = embeddings.shape
         embeddings = self.LayerNorm(embeddings)
         if reference_embeddings is None:
-            # allow dynamic stride override at runtime for accurate coordinate mapping
-            if stride_override is not None:
-                self.get_reference_embedding.stride = int(stride_override)
-            reference_embeddings = self.get_reference_embedding(self.Unflatten(embeddings), reference_locations)
+            if image_size is not None:
+                reference_embeddings = self.get_reference_embedding(self.Unflatten(embeddings), reference_locations, image_size=image_size)
+            else:
+                if stride_override is not None:
+                    self.get_reference_embedding.stride = int(stride_override)
+                reference_embeddings = self.get_reference_embedding(self.Unflatten(embeddings), reference_locations)
 
         q = self.query(reference_embeddings).reshape(B, 1, self.num_heads, self.head_channels).permute(0, 2, 1, 3)
         k = self.key(embeddings).reshape(B, N, self.num_heads, self.head_channels).permute(0, 2, 1, 3)
@@ -190,12 +213,31 @@ class FeatureFusionBlock_custom(nn.Module):
 
     def forward(self, *xs):
         output = xs[0]
+        
         if len(xs) == 2:
             res = self.resConfUnit1(xs[1])
+            
+            # Size alignment before fusion
+            if res.shape[2:] != output.shape[2:]:
+                res = nn.functional.interpolate(
+                    res, 
+                    size=(output.shape[2], output.shape[3]), 
+                    mode="bilinear", 
+                    align_corners=self.align_corners
+                )
+            
             output = self.skip_add.add(output, res)
+        
         output = self.resConfUnit2(output)
+        
         if self.upsample:
-            output = nn.functional.interpolate(output, scale_factor=self.upsample_scale, mode="bilinear", align_corners=self.align_corners)
+            output = nn.functional.interpolate(
+                output, 
+                scale_factor=self.upsample_scale, 
+                mode="bilinear", 
+                align_corners=self.align_corners
+            )
+        
         output = self.out_conv(output)
         return output
 
@@ -254,20 +296,20 @@ class Transformer_DINOv2_ViTB14(nn.Module):
             nn.Linear(128, 1)
         )
 
-        self.linear_proj.apply(init_weights)
-        self.reduce_1.apply(init_weights)
-        self.reduce_2.apply(init_weights)
-        self.reduce_3.apply(init_weights)
-        self.reduce_4.apply(init_weights)
-        self.cross_attention_1.apply(init_weights)
-        self.cross_attention_2.apply(init_weights)
-        self.cross_attention_3.apply(init_weights)
-        self.cross_attention_4.apply(init_weights)
-        self.fusion_1.apply(init_weights)
-        self.fusion_2.apply(init_weights)
-        self.fusion_3.apply(init_weights)
-        self.fusion_4.apply(init_weights)
-        self.out_conv.apply(init_weights)
+        self.linear_proj.apply(weights_init)
+        self.reduce_1.apply(weights_init)
+        self.reduce_2.apply(weights_init)
+        self.reduce_3.apply(weights_init)
+        self.reduce_4.apply(weights_init)
+        self.cross_attention_1.apply(weights_init)
+        self.cross_attention_2.apply(weights_init)
+        self.cross_attention_3.apply(weights_init)
+        self.cross_attention_4.apply(weights_init)
+        self.fusion_1.apply(weights_init)
+        self.fusion_2.apply(weights_init)
+        self.fusion_3.apply(weights_init)
+        self.fusion_4.apply(weights_init)
+        self.out_conv.apply(weights_init)
 
     def _split_tiles(self, x, r: int = 518, mult: int = 14):
         B, C, H, W = x.shape
@@ -360,17 +402,12 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         emb_3 = agg_3.permute(0, 2, 3, 1).reshape(B, -1, 256)
         emb_4 = agg_4.permute(0, 2, 3, 1).reshape(B, -1, 256)
 
-        # compute dynamic strides from output/image size and feature map size
+        # 使用比例映射（image_size）避免 1036/296 非整數 stride 
         H, W = out_size
-        stride_1 = max(1, round(H / target_1[0]))
-        stride_2 = max(1, round(H / target_2[0]))
-        stride_3 = max(1, round(H / target_3[0]))
-        stride_4 = max(1, round(H / target_4[0]))
-
-        ca1, *_ = self.cross_attention_1(emb_1, reference_locations, stride_override=stride_1)
-        ca2, *_ = self.cross_attention_2(emb_2, reference_locations, stride_override=stride_2)
-        ca3, *_ = self.cross_attention_3(emb_3, reference_locations, stride_override=stride_3)
-        ca4, *_ = self.cross_attention_4(emb_4, reference_locations, stride_override=stride_4)
+        ca1, *_ = self.cross_attention_1(emb_1, reference_locations, image_size=(H, W))
+        ca2, *_ = self.cross_attention_2(emb_2, reference_locations, image_size=(H, W))
+        ca3, *_ = self.cross_attention_3(emb_3, reference_locations, image_size=(H, W))
+        ca4, *_ = self.cross_attention_4(emb_4, reference_locations, image_size=(H, W))
 
         ca1 = ca1.permute(0, 2, 1).reshape(B, -1, target_1[0], target_1[1])
         ca2 = ca2.permute(0, 2, 1).reshape(B, -1, target_2[0], target_2[1])
@@ -413,12 +450,18 @@ class Transformer_DINOv2_ViTB14(nn.Module):
 
     def forward(self, x, reference_locations):
         B, C, H, W = x.shape
+        # 固定工作解析度到 1036（=74×14），並將 query 映到該座標系
+        H_pad = W_pad = 1036
+        ref = reference_locations.clone().float()
+        ref[:, 0] = ref[:, 0] * (H_pad / H)
+        ref[:, 1] = ref[:, 1] * (W_pad / W)
         enc = self.encode_image(x)
         agg = enc["agg"]
-        scores, path1, path2, path3, path4 = self.forward_with_features(agg, reference_locations, out_size=(H, W))
+        pred_pad, path1, path2, path3, path4 = self.forward_with_features(agg, ref, out_size=(H_pad, W_pad))
+        # 回原尺寸
+        scores = F.interpolate(pred_pad.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=True)[:, 0]
         layer_1, layer_2, layer_3, layer_4 = enc["layers"]
         # for compatibility with visualization (context_embeddings_*), return agg features
         agg_1, agg_2, agg_3, agg_4 = agg
         return scores, path1, path2, path3, path4, agg_1, agg_2, agg_3, agg_4, layer_1, layer_2, layer_3, layer_4
-
 
