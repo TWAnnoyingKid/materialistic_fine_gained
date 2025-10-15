@@ -104,7 +104,11 @@ class ReferenceEmbedding(nn.Module):
 
     def forward(self, embeddings, reference_locations):
         reference_locations_patch = torch.div(reference_locations, self.stride, rounding_mode="trunc")
-        reference_embeddings = embeddings[range(embeddings.shape[0]), :, reference_locations_patch[:, 0].type(torch.long), reference_locations_patch[:, 1].type(torch.long)]
+        # clamp to valid spatial range to avoid out-of-bounds
+        Hf, Wf = embeddings.shape[2], embeddings.shape[3]
+        ref_h = reference_locations_patch[:, 0].clamp(0, Hf - 1).type(torch.long)
+        ref_w = reference_locations_patch[:, 1].clamp(0, Wf - 1).type(torch.long)
+        reference_embeddings = embeddings[range(embeddings.shape[0]), :, ref_h, ref_w]
 
         local_coordinate = local_pixel_coord(reference_locations[:, 0].type(torch.long), reference_locations[:, 1].type(torch.long), self.stride)
         local_coordinate = torch.stack(local_coordinate, dim=1).to(embeddings.device)
@@ -355,11 +359,11 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         target_3 = (agg_3.shape[2], agg_3.shape[3])
         target_4 = (agg_4.shape[2], agg_4.shape[3])
 
-        # Spatial processing (Materialistic-style fixed upsample factors)
-        sp1 = F.interpolate(agg_1, scale_factor=4.0, mode='bilinear', align_corners=True)
-        sp2 = F.interpolate(agg_2, scale_factor=2.0, mode='bilinear', align_corners=True)
-        sp3 = agg_3
-        sp4 = agg_4
+        # Spatial Processing (FG-style): s={4,2,1,1}
+        sp1 = F.interpolate(agg_1, scale_factor=4.0, mode='bilinear', align_corners=True)   # 74 -> 296
+        sp2 = F.interpolate(agg_2, scale_factor=2.0, mode='bilinear', align_corners=True)   # 74 -> 148
+        sp3 = agg_3  # 74
+        sp4 = agg_4  # 74
 
         emb_1 = sp1.permute(0, 2, 3, 1).reshape(B, -1, 256)
         emb_2 = sp2.permute(0, 2, 3, 1).reshape(B, -1, 256)
@@ -368,6 +372,7 @@ class Transformer_DINOv2_ViTB14(nn.Module):
 
         # compute dynamic strides from output/image size and feature map size
         H, W = out_size
+        # Cross-sim strides derived from SP sizes; if可控，建議將 out_size pad 為 1184
         stride_1 = max(1, H // sp1.shape[2])
         stride_2 = max(1, H // sp2.shape[2])
         stride_3 = max(1, H // sp3.shape[2])
@@ -419,9 +424,15 @@ class Transformer_DINOv2_ViTB14(nn.Module):
 
     def forward(self, x, reference_locations):
         B, C, H, W = x.shape
+        # pad working resolution to be divisible by 296 for integer strides {4,8,16,16}
+        base = 296
+        H_pad = ((H + base - 1) // base) * base
+        W_pad = ((W + base - 1) // base) * base
         enc = self.encode_image(x)
         agg = enc["agg"]
-        scores, path1, path2, path3, path4 = self.forward_with_features(agg, reference_locations, out_size=(H, W))
+        pred_pad, path1, path2, path3, path4 = self.forward_with_features(agg, reference_locations, out_size=(H_pad, W_pad))
+        # resize logits back to original size
+        scores = F.interpolate(pred_pad.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=True)[:, 0]
         layer_1, layer_2, layer_3, layer_4 = enc["layers"]
         # for compatibility with visualization (context_embeddings_*), return agg features
         agg_1, agg_2, agg_3, agg_4 = agg
