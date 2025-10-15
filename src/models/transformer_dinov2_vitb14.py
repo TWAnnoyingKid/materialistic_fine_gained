@@ -49,6 +49,14 @@ class Unflatten(nn.Module):
         return x
 
 
+def resize_to(x, size, align_corners=True):
+    """Resample with bilinear for upsample, area for downsample."""
+    in_h, in_w = x.shape[-2], x.shape[-1]
+    out_h, out_w = size
+    if out_h <= in_h and out_w <= in_w:
+        return F.interpolate(x, size=size, mode='area')
+    return F.interpolate(x, size=size, mode='bilinear', align_corners=align_corners)
+
 def weights_init(m, init_type='xavier_uniform', gain=0.02):
     classname = m.__class__.__name__
     if 'BatchNorm2d' in classname:
@@ -95,6 +103,17 @@ def local_pixel_coord_float(x, y, s_float):
     out_y = (y - patch_center_y) / ((s_float - 1.) / 2 + 1e-4)
     return out_x, out_y
 
+def local_pixel_coord_float_aniso(x, y, s_x, s_y):
+    px = torch.floor(x / s_x)
+    py = torch.floor(y / s_y)
+
+    cx = px * s_x + (s_x - 1.)/2.
+    cy = py * s_y + (s_y - 1.)/2.
+
+    out_x = (x - cx) / ((s_x - 1.) / 2 + 1e-4)
+    out_y = (y - cy) / ((s_y - 1.) / 2 + 1e-4)
+    return out_x, out_y
+
 
 class ReferenceEmbedding(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -115,18 +134,19 @@ class ReferenceEmbedding(nn.Module):
             ref_h = ref_h.clamp(0, Hf - 1).long()
             ref_w = ref_w.clamp(0, Wf - 1).long()
 
-            s_h = float(H_pad) / float(Hf)
-            s_w = float(W_pad) / float(Wf)
-            s_float = (s_h + s_w) / 2.0
+            s_y = float(H_pad) / float(Hf)
+            s_x = float(W_pad) / float(Wf)
 
-            reference_embeddings = embeddings[range(B), :, ref_h, ref_w]
-            lx, ly = local_pixel_coord_float(reference_locations[:, 1].float(), reference_locations[:, 0].float(), s_float)
+            b_ix = torch.arange(B, device=embeddings.device)
+            reference_embeddings = embeddings[b_ix, :, ref_h, ref_w]
+            lx, ly = local_pixel_coord_float_aniso(reference_locations[:, 1].float(), reference_locations[:, 0].float(), s_x, s_y)
             local_coordinate = torch.stack([lx, ly], dim=1).to(embeddings.device)
         else:
             ref = torch.div(reference_locations, self.stride, rounding_mode="trunc")
             ref_h = ref[:, 0].clamp(0, Hf - 1).long()
             ref_w = ref[:, 1].clamp(0, Wf - 1).long()
-            reference_embeddings = embeddings[range(B), :, ref_h, ref_w]
+            b_ix = torch.arange(B, device=embeddings.device)
+            reference_embeddings = embeddings[b_ix, :, ref_h, ref_w]
             lx, ly = local_pixel_coord(reference_locations[:, 1].float(), reference_locations[:, 0].float(), self.stride)
             local_coordinate = torch.stack([lx, ly], dim=1).to(embeddings.device)
 
@@ -335,11 +355,15 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         """
         B, C, H, W = x.shape
         r = 518
+        # DINOv2 normalization (ImageNet)
+        mean = x.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
+        std = x.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
+        x_norm = (x - mean) / std
         # I1 full
-        i1 = F.interpolate(x, size=(r, r), mode='bilinear', align_corners=True)
+        i1 = F.interpolate(x_norm, size=(r, r), mode='bilinear', align_corners=True)
         t_i1 = self._encode_tokens(i1)
         # I2 tiles
-        tiles = self._split_tiles(x, r=r)
+        tiles = self._split_tiles(x_norm, r=r)
         t_tiles = [self._encode_tokens(t) for t in tiles]
 
         # project tokens to spatial per block
@@ -361,20 +385,20 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         # per-block targets unified to 74x74 (FG-style) for manageable token counts
         target_1 = target_2 = target_3 = target_4 = (74, 74)
 
-        i1_1 = F.interpolate(sp_i1_1, size=target_1, mode='bilinear', align_corners=True)
-        i2_1 = F.interpolate(sp_i2_1, size=target_1, mode='bilinear', align_corners=True)
+        i1_1 = resize_to(sp_i1_1, target_1, align_corners=True)
+        i2_1 = resize_to(sp_i2_1, target_1, align_corners=True)
         agg_1 = self.reduce_1(torch.cat([i1_1, i2_1], dim=1))
 
-        i1_2 = F.interpolate(sp_i1_2, size=target_2, mode='bilinear', align_corners=True)
-        i2_2 = F.interpolate(sp_i2_2, size=target_2, mode='bilinear', align_corners=True)
+        i1_2 = resize_to(sp_i1_2, target_2, align_corners=True)
+        i2_2 = resize_to(sp_i2_2, target_2, align_corners=True)
         agg_2 = self.reduce_2(torch.cat([i1_2, i2_2], dim=1))
 
-        i1_3 = F.interpolate(sp_i1_3, size=target_3, mode='bilinear', align_corners=True)
-        i2_3 = F.interpolate(sp_i2_3, size=target_3, mode='bilinear', align_corners=True)
+        i1_3 = resize_to(sp_i1_3, target_3, align_corners=True)
+        i2_3 = resize_to(sp_i2_3, target_3, align_corners=True)
         agg_3 = self.reduce_3(torch.cat([i1_3, i2_3], dim=1))
 
-        i1_4 = F.interpolate(sp_i1_4, size=target_4, mode='bilinear', align_corners=True)
-        i2_4 = F.interpolate(sp_i2_4, size=target_4, mode='bilinear', align_corners=True)
+        i1_4 = resize_to(sp_i1_4, target_4, align_corners=True)
+        i2_4 = resize_to(sp_i2_4, target_4, align_corners=True)
         agg_4 = self.reduce_4(torch.cat([i1_4, i2_4], dim=1))
 
         return {
@@ -397,22 +421,27 @@ class Transformer_DINOv2_ViTB14(nn.Module):
         target_3 = (agg_3.shape[2], agg_3.shape[3])
         target_4 = (agg_4.shape[2], agg_4.shape[3])
 
-        emb_1 = agg_1.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_2 = agg_2.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_3 = agg_3.permute(0, 2, 3, 1).reshape(B, -1, 256)
-        emb_4 = agg_4.permute(0, 2, 3, 1).reshape(B, -1, 256)
-
-        # 使用比例映射（image_size）避免 1036/296 非整數 stride 
+        # Spatial Processing 上採樣：s={4,2,1,1} → 74→296/148/74/74，再做 Cross-Attn（比例映射）
         H, W = out_size
+        sp1 = resize_to(agg_1, (74 * 4, 74 * 4), align_corners=True)  # 296
+        sp2 = resize_to(agg_2, (74 * 2, 74 * 2), align_corners=True)  # 148
+        sp3 = agg_3  # 74
+        sp4 = agg_4  # 74
+
+        emb_1 = sp1.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_2 = sp2.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_3 = sp3.permute(0, 2, 3, 1).reshape(B, -1, 256)
+        emb_4 = sp4.permute(0, 2, 3, 1).reshape(B, -1, 256)
+
         ca1, *_ = self.cross_attention_1(emb_1, reference_locations, image_size=(H, W))
         ca2, *_ = self.cross_attention_2(emb_2, reference_locations, image_size=(H, W))
         ca3, *_ = self.cross_attention_3(emb_3, reference_locations, image_size=(H, W))
         ca4, *_ = self.cross_attention_4(emb_4, reference_locations, image_size=(H, W))
 
-        ca1 = ca1.permute(0, 2, 1).reshape(B, -1, target_1[0], target_1[1])
-        ca2 = ca2.permute(0, 2, 1).reshape(B, -1, target_2[0], target_2[1])
-        ca3 = ca3.permute(0, 2, 1).reshape(B, -1, target_3[0], target_3[1])
-        ca4 = ca4.permute(0, 2, 1).reshape(B, -1, target_4[0], target_4[1])
+        ca1 = ca1.permute(0, 2, 1).reshape(B, -1, sp1.shape[2], sp1.shape[3])
+        ca2 = ca2.permute(0, 2, 1).reshape(B, -1, sp2.shape[2], sp2.shape[3])
+        ca3 = ca3.permute(0, 2, 1).reshape(B, -1, sp3.shape[2], sp3.shape[3])
+        ca4 = ca4.permute(0, 2, 1).reshape(B, -1, sp4.shape[2], sp4.shape[3])
 
         path4 = self.fusion_4(ca4)
         path3 = self.fusion_3(ca3, path4)
