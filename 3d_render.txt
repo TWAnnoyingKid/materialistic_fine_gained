@@ -1,0 +1,73 @@
+python 3D_pipeline/3d_model_convert.py --input_dir /home/bei/all_stuff/3D_pipeline/model_pics/Chair2 --text_promt "chair" --save_intermediate --brightness 1.2
+
+
+python /home/bei/all_stuff/3D_pipeline/TRELLIS/render_3dgs_multiview.py \
+    --fov 40 \
+    --input /home/bei/all_stuff/3D_pipeline/outputs/cabinet_2025_0930_082241/cabinet.ply\
+    --nviews 150 \
+    --out multiview_render_shuffle_150_40
+
+python /home/bei/IDArb/main_sw.py \
+  --data_dir /home/bei/all_stuff/3D_pipeline/outputs/Chair2_2025_0908_135759/multiview_render_shuffle_100 \
+  --input_type multi \
+  --num_views 3 \
+  --output_dir /home/bei/IDArb/output_100
+
+python /home/bei/all_stuff/3D_pipeline/IDArb/main_optimized.py \
+  --data_dir /home/bei/all_stuff/3D_pipeline/outputs/sofa3_100v/mv \
+  --input_type multi \
+  --num_views 100 \
+  --cam \
+  --diffusion_batch_size 12 \
+  --decode_batch_size 5 \
+  --sw_stride 10 \
+  --attn_mem_enable \
+  --attn_mem_decay 0.9 \
+  --output_dir /home/bei/all_stuff/3D_pipeline/outputs/sofa3_100v/mv
+
+python /home/bei/all_stuff/3D_pipeline/TRELLIS/mesh_rasterize_from_pt.py \
+    --pt_file /home/bei/all_stuff/3D_pipeline/outputs/Chair2_2025_0908_094914/Chair2.pt \
+    --transforms /home/bei/all_stuff/3D_pipeline/outputs/Chair2_2025_0908_094914/multiview_render_100views/transforms.json \
+    --out mesh_rasterize-flip_green
+
+python /home/bei/all_stuff/3D_pipeline/TRELLIS/pbr_bake.py \
+    --data_dir /home/bei/all_stuff/3D_pipeline/outputs/sofa3_100v/mv \
+    --pt /home/bei/all_stuff/3D_pipeline/outputs/sofa3_100v/sofa3.pt \
+    --mode opt \
+    --out_dir bake_out \
+    --tex_res 1024 \
+    --smooth-seams --remesh \
+
+python train.py \
+  --exp_name materialistic_dinov2_b14_mq \
+  --config ./configs/transformer_dinov2_vitb14.cfg \
+  --data_dir /mnt/data1/abo_dataset/synth_real \
+  --image_size 1024 \
+  --batch_size 1 \
+  --epochs 30 \
+  --num_gpus 1 \
+  --lr 1e-4 \
+  --precision 16 \
+  --accumulate_grad_batches 4 \
+  --num_queries 5 \
+  --max_batch_queries 2 \
+  --train_workers 4 --val_workers 2 \
+  --print_every 2000
+
+
+python train.py \
+  --exp_name materialistic_dinov2_b14_mq10 \
+  --config ./configs/transformer_dinov2_vitb14.cfg \
+  --data_dir /mnt/data1/abo_dataset/synth_real \
+  --image_size 1024 \
+  --batch_size 2 \
+  --epochs 30 \
+  --num_gpus 1 \
+  --lr 1e-4 \
+  --precision 16 \
+  --accumulate_grad_batches 4 \
+  --num_queries 10 \
+  --max_batch_queries 5 \
+  --train_workers 4 \
+  --val_workers 2 \
+  --print_every 1000
